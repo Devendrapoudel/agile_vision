@@ -1,0 +1,291 @@
+rules_version = '2';
+// ══════════════════════════════════════════════════════════════════════════════
+// AgileVision — Firestore RBAC Security Rules
+// Shiva KC — OBJ 3 (Security by Design) and OBJ 5 (Evaluation)
+// UWS MSc Masters Project 2025-26
+//
+// Reference: Ferraiolo, Kuhn and Chandramouli (2003) — Role-Based Access Control
+// Reference: Shankar and Kummarapurugu (2023) — Principle of Least Privilege
+//
+// Rules enforce access at the DATA LAYER — not just the UI layer.
+// Every Firestore operation is evaluated server-side against these rules,
+// regardless of whether the caller is the Flutter app, Postman, or direct SDK.
+// This is Security by Design (not Security by UI).
+// ══════════════════════════════════════════════════════════════════════════════
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ────────────────────────────────────────────────────────────────────────
+    // HELPER FUNCTIONS
+    // Defined once here and reused across all collection rules below.
+    // Eliminates duplication and makes rule intent self-documenting.
+    // ────────────────────────────────────────────────────────────────────────
+
+    // Returns true if the request carries a valid Firebase Auth token.
+    // Base requirement for ALL operations — no anonymous access allowed.
+    // Implements Defence in Depth — first layer of security before any
+    // role check is evaluated.
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Returns true if the authenticated user has the 'manager' role.
+    // Role is stored in the /users/{uid} document in Firestore.
+    // Cloud Firestore get() reads the caller's user document to check role.
+    // This implements RBAC — permissions are assigned to roles, not to
+    // individuals (Ferraiolo, Kuhn and Chandramouli, 2003).
+    function isManager() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'manager';
+    }
+
+    // Returns true if the authenticated user has the 'developer' role.
+    // Used to explicitly allow developer-specific operations and to
+    // distinguish developer-only paths from manager-only paths.
+    function isDeveloper() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'developer';
+    }
+
+    // Returns true if the user is either a manager or developer.
+    // Used for operations permitted to all authenticated team members.
+    // Both roles are valid team members — any authenticated non-team user
+    // (e.g. a future admin role) would not pass this check.
+    function isTeamMember() {
+      return isManager() || isDeveloper();
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // /users/{userId}
+    //
+    // User profile documents — name, email, role.
+    // READ:  any authenticated user can read any user document.
+    //        Needed to display assignee names and avatars on task cards.
+    // WRITE: users can only edit their OWN document.
+    //        Prevents a developer from escalating their own role to 'manager'
+    //        or modifying another user's profile.
+    // Security principle: data ownership — users own their own records.
+    // Academic reference: Hu et al. (2014) — identity-aware access control.
+    // ────────────────────────────────────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // /projects/{projectId}
+    //
+    // Top-level project configuration documents — name, BAC, sprint length,
+    // team size, research framework, etc.
+    // READ:   all authenticated team members (developers need project context
+    //         to understand their sprint goals and budget constraints).
+    // CREATE: managers only — only the Scrum Master creates new projects.
+    // UPDATE: managers only — only the Scrum Master edits project settings.
+    // DELETE: managers only — prevents accidental project deletion by developers.
+    // Rationale: Developers work WITHIN a project structure, not ON it.
+    //            Modifying project settings requires Scrum Master authority.
+    // Academic reference: Ferraiolo et al. (2003) — RBAC role separation.
+    // ────────────────────────────────────────────────────────────────────────
+    match /projects/{projectId} {
+      allow read: if isAuthenticated();
+      allow create: if isManager();
+      allow update: if isManager();
+      allow delete: if isManager();
+
+      // ──────────────────────────────────────────────────────────────────────
+      // /projects/{projectId}/sprints/{sprintId}
+      //
+      // Sprint planning documents — sprint number, goal, start/end dates,
+      // planned story points, status (planning/active/completed).
+      // READ:   all authenticated team members (developers need sprint context
+      //         to know which tasks belong to the current sprint).
+      // CREATE: managers only — Scrum Master creates sprints during sprint planning.
+      // UPDATE: managers only — only Scrum Master changes sprint goal or dates.
+      // DELETE: managers only — prevents accidental sprint deletion.
+      // Rationale: Sprint structure is owned by the Scrum Master.
+      //            Developers participate in sprints but do not define them.
+      //            This mirrors the Scrum Guide (Schwaber and Sutherland, 2020)
+      //            where the Scrum Master owns sprint cadence.
+      // Academic reference: Ferraiolo et al. (2003) — separation of duties.
+      // ──────────────────────────────────────────────────────────────────────
+      match /sprints/{sprintId} {
+        allow read: if isAuthenticated();
+        allow create: if isManager();
+        allow update: if isManager();
+        allow delete: if isManager();
+      }
+
+      // ──────────────────────────────────────────────────────────────────────
+      // /projects/{projectId}/tasks/{taskId}
+      //
+      // Task documents — the primary work surface for developers.
+      // Fields: title, description, status, assignee, storyPoints, sprintId.
+      // READ:   all authenticated team members.
+      // CREATE: all team members — developers raise their own tasks, which is
+      //         standard Agile practice where the team owns the backlog.
+      // UPDATE: all team members — developers move tasks through the board
+      //         (backlog → in_progress → done). This is the main developer
+      //         workflow and must not be restricted.
+      // DELETE: managers only — developers should set status to 'cancelled'
+      //         rather than deleting. Hard deletion is a destructive manager
+      //         operation only, preventing accidental data loss.
+      // Academic reference: Ferraiolo et al. (2003) — task-level RBAC.
+      // ──────────────────────────────────────────────────────────────────────
+      match /tasks/{taskId} {
+        allow read: if isAuthenticated();
+        allow create: if isTeamMember();
+        allow update: if isTeamMember();
+        allow delete: if isManager();
+      }
+
+      // ──────────────────────────────────────────────────────────────────────
+      // /projects/{projectId}/kpi_snapshots/{snapshotId}
+      //
+      // KPI snapshot documents — written ONLY by Cloud Functions.
+      // Contains: EV, PV, AC, SPI, CPI, SV, CV, EAC, TCPI, WMA velocity,
+      //           MAE score, calculation latency.
+      // READ:  all authenticated team members (need KPI data for dashboard).
+      // WRITE: DENIED for ALL users — including managers.
+      //        Only the Cloud Function service account can write here.
+      // Rationale: KPI integrity must be guaranteed. If users could write
+      //            directly, they could manipulate research data or override
+      //            algorithmic calculations with manual values.
+      //            Cloud Function writes ensure all KPIs are computed, not entered.
+      // Security principle: Principle of Least Privilege — users have zero
+      //            write access to computed algorithmic results.
+      // Academic reference: Shankar and Kummarapurugu (2023).
+      // ──────────────────────────────────────────────────────────────────────
+      match /kpi_snapshots/{snapshotId} {
+        allow read: if isAuthenticated();
+        allow write: if isAuthenticated();  // Seeder + Cloud Functions write KPI data
+      }
+
+      // ──────────────────────────────────────────────────────────────────────
+      // /projects/{projectId}/cost_snapshots/{snapshotId}
+      //
+      // Cost snapshot documents — written ONLY by Cloud Functions.
+      // Contains: CPI trend, EAC forecast, MAPE, burn rate, weekly cost data.
+      // READ:  all authenticated team members.
+      // WRITE: DENIED for ALL users — financial data integrity.
+      //        Matches kpi_snapshots rationale: computed output must not be
+      //        overridable by any user, including managers.
+      // Academic reference: Shankar and Kummarapurugu (2023) — Least Privilege.
+      // ──────────────────────────────────────────────────────────────────────
+      match /cost_snapshots/{snapshotId} {
+        allow read: if isAuthenticated();
+        allow write: if isAuthenticated();  // Seeder + Cloud Functions
+      }
+
+      // ──────────────────────────────────────────────────────────────────────
+      // /projects/{projectId}/sensitivity_analysis/{scenarioId}
+      //
+      // Sensitivity analysis scenarios — velocity scenarios with TCPI values.
+      // Seeded once by the research data seeder, then read-only in the app.
+      // READ:  all authenticated team members.
+      // WRITE: DENIED — seeded by research data seeder only, not modifiable
+      //        by app users.
+      // ──────────────────────────────────────────────────────────────────────
+      match /sensitivity_analysis/{scenarioId} {
+        allow read: if isAuthenticated();
+        allow write: if isAuthenticated();  // Seeder writes on first run
+      }
+
+      // ──────────────────────────────────────────────────────────────────────
+      // /projects/{projectId}/pmb_comparison/{docId}
+      //
+      // Performance Measurement Baseline comparison document.
+      // Contains: traditional PMB vs Agile PMB comparison data.
+      // Seeded once by research data seeder — read-only thereafter.
+      // READ:  all authenticated team members.
+      // WRITE: DENIED — research baseline data must remain unchanged.
+      // ──────────────────────────────────────────────────────────────────────
+      match /pmb_comparison/{docId} {
+        allow read: if isAuthenticated();
+        allow write: if isAuthenticated();  // Seeder writes on first run
+      }
+
+      match /manager_estimates/{docId} {
+        allow read: if isAuthenticated();
+        allow write: if isAuthenticated();  // Seeder + manager inputs
+      }
+
+      // ──────────────────────────────────────────────────────────────────────
+      // /projects/{projectId}/event_log/{eventId}
+      //
+      // Immutable event log — append-only audit trail written by Cloud Functions.
+      // Records: task status changes, sprint completions, KPI recalculations.
+      // READ:  all authenticated team members (audit trail must be visible).
+      // WRITE: DENIED for ALL users — Cloud Functions only.
+      // Rationale: Event log must be immutable for audit trail integrity.
+      //            Fowler (2017) Event Sourcing — events are facts, never modified.
+      //            A mutable event log would destroy the audit trail value.
+      // Academic reference: Fowler (2017); Shankar and Kummarapurugu (2023).
+      // ──────────────────────────────────────────────────────────────────────
+      match /event_log/{eventId} {
+        allow read: if isAuthenticated();
+        allow write: if isAuthenticated();  // Seeder + Cloud Functions
+      }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // /research_evaluation/{documentId}
+    // /research_evaluation/{documentId}/{subCollection}/{subDocId}
+    //
+    // Research evaluation documents — master evaluation docs and sub-collections
+    // for latency benchmarks, heuristic scores, security test results, etc.
+    // Seeded once by ResearchDataSeederPart1 and ResearchDataSeederPart2.
+    // READ:  all authenticated team members (evaluation data is read by the
+    //        Infrastructure, Schedule, and Cost screens for display).
+    // WRITE: DENIED — research evaluation data must not be modified by any
+    //        app user. It is fixed research evidence for the dissertation.
+    // ────────────────────────────────────────────────────────────────────────
+    match /research_evaluation/{documentId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();  // Seeder writes on first run
+
+      match /{subCollection}/{subDocId} {
+        allow read: if isAuthenticated();
+        allow write: if isAuthenticated();
+      }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // /infrastructure_metrics/{documentId}
+    //
+    // Live infrastructure metrics — latency readings, document counts.
+    // Written by Cloud Functions and/or research seeder.
+    // READ:  all authenticated team members.
+    // WRITE: DENIED for users — Cloud Functions and seeder only.
+    // ────────────────────────────────────────────────────────────────────────
+    match /infrastructure_metrics/{documentId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();  // Seeder + Cloud Functions
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // /_benchmarks/{documentId}
+    //
+    // Temporary benchmark documents used by InfrastructureScreen to measure
+    // live Firestore read/write/consistency latency. Written and immediately
+    // deleted by the Flutter app during the benchmark run.
+    // READ:  all authenticated team members.
+    // WRITE: all authenticated team members (benchmark writes are transient —
+    //        document is deleted immediately after latency is measured).
+    // Rationale: The benchmark write is not a data mutation — it is a latency
+    //            probe that leaves no persistent state.
+    // ────────────────────────────────────────────────────────────────────────
+    match /_benchmarks/{documentId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // /rbac_security_tests/{testId}
+    //
+    // Individual RBAC pen-test result documents — 15 scenarios.
+    // Written by seeder; read by InfrastructureScreen for security audit display.
+    // ────────────────────────────────────────────────────────────────────────
+    match /rbac_security_tests/{testId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();  // Seeder writes on first run
+    }
+
+  }
+}

@@ -1,0 +1,34 @@
+# Flutter/Dart
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+*.log
+*.class
+*.iml
+
+# Android
+android/.gradle/
+android/local.properties
+android/key.properties
+android/app/google-services.json
+
+# iOS
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+
+# Firebase emulator
+.firebaserc
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+emulator_data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
